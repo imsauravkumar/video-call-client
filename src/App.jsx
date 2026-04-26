@@ -54,6 +54,7 @@ export default function App() {
         onBack={handleBack}
         roomCode={roomCode}
         setRoomCode={setRoomCode}
+        isHost={isHost}
         phase={phase}
         setPhase={setPhase}
         error={error}

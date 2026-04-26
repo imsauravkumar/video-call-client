@@ -1,8 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { io } from "socket.io-client";
-import { Mic, MicOff, Video, VideoOff, RotateCcw, PhoneOff } from "lucide-react";
-
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3001";
+import { Mic, MicOff, Video, VideoOff, RotateCcw, PhoneOff, MessageCircle } from "lucide-react";
 
 function buildIceServers() {
   const servers = [{ urls: "stun:stun.l.google.com:19302" }];
@@ -27,14 +24,14 @@ function formatCode(code) {
   return `${c.slice(0, 3)} ${c.slice(3)}`;
 }
 
-export default function Call({ socket, onBack, roomCode, setRoomCode, phase, setPhase, error, setError, messages, setMessages, chatInput, setChatInput }) {
-  const [isHost, setIsHost] = useState(false);
+export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, phase, setPhase, error, setError, messages, setMessages, chatInput, setChatInput }) {
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
   const [facingMode, setFacingMode] = useState("user");
   const [localVideoPos, setLocalVideoPos] = useState({ x: 20, y: 20 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [showChat, setShowChat] = useState(false);
 
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
@@ -106,6 +103,7 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, phase, set
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = remoteStreamRef.current;
       }
+      setPhase("in-call");
     };
 
     pc.onicecandidate = (event) => {
@@ -133,7 +131,19 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, phase, set
   async function preparePeer() {
     const stream = await ensureLocalMedia();
     const pc = createPeerConnection();
-    for (const track of stream.getTracks()) pc.addTrack(track, stream);
+    const existingTrackIds = new Set(
+      pc.getSenders()
+        .map((sender) => sender.track?.id)
+        .filter(Boolean)
+    );
+
+    for (const track of stream.getTracks()) {
+      if (!existingTrackIds.has(track.id)) {
+        pc.addTrack(track, stream);
+      }
+    }
+
+    return pc;
   }
 
   async function startOffer() {
@@ -199,7 +209,6 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, phase, set
     setMessages([]);
     setChatInput("");
     setRoomCode("");
-    setIsHost(false);
     setPhase("lobby");
     if (!options.keepError) {
       setError("");
@@ -208,11 +217,16 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, phase, set
 
   useEffect(() => {
     function onPeerJoined() {
-      if (isHostRef.current) startOffer().catch(() => {});
+      if (isHostRef.current) {
+        preparePeer()
+          .then(() => startOffer())
+          .catch(() => {});
+      }
       setPhase("connecting");
     }
 
     function onRoomJoined() {
+      preparePeer().catch(() => {});
       setPhase("connecting");
     }
 
@@ -221,7 +235,10 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, phase, set
     }
 
     function onChat(msg) {
-      // Chat disabled in full screen mode
+      setMessages(prev => [...prev, {
+        message: msg.message,
+        sender: msg.from === socket.id ? "You" : "Peer"
+      }]);
     }
 
     function onPeerLeft() {
@@ -453,6 +470,16 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, phase, set
           {camOn ? <Video size={18} className="sm:w-5 sm:h-5" /> : <VideoOff size={18} className="sm:w-5 sm:h-5" />}
         </button>
         <button
+          onClick={() => setShowChat(!showChat)}
+          className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-colors ${
+            showChat
+              ? "bg-blue-500 hover:bg-blue-600"
+              : "bg-white/20 hover:bg-white/30"
+          }`}
+        >
+          <MessageCircle size={18} className="sm:w-5 sm:h-5" />
+        </button>
+        <button
           onClick={swapCamera}
           className="w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center transition-colors"
         >
@@ -465,6 +492,50 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, phase, set
           <PhoneOff size={20} className="sm:w-6 sm:h-6" />
         </button>
       </div>
+
+      {/* Chat Interface */}
+      {showChat && (
+        <div className="absolute right-0 top-0 bottom-0 w-80 bg-black/80 backdrop-blur-sm border-l border-white/20 z-30 flex flex-col">
+          <div className="p-4 border-b border-white/20">
+            <h3 className="text-white font-semibold">Chat</h3>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-2">
+            {messages.map((msg, idx) => (
+              <div key={idx} className="text-white bg-white/10 rounded-lg p-2">
+                <div className="text-sm opacity-75">{msg.sender || "Peer"}</div>
+                <div>{msg.message}</div>
+              </div>
+            ))}
+          </div>
+          <div className="p-4 border-t border-white/20">
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (chatInput.trim()) {
+                  socket.emit("chat:message", { code: roomCode, message: chatInput });
+                  setChatInput("");
+                }
+              }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder="Type a message..."
+                className="flex-1 px-3 py-2 bg-white/10 border border-white/20 rounded-lg text-white placeholder-white/50 focus:outline-none focus:border-white/40"
+              />
+              <button
+                type="submit"
+                className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors"
+              >
+                Send
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
+
 }
