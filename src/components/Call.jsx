@@ -32,6 +32,7 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [showChat, setShowChat] = useState(false);
+  const [hasUnreadMessage, setHasUnreadMessage] = useState(false);
 
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
@@ -66,6 +67,12 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       console.log("Remote stream tracks:", remoteStreamRef.current.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled })));
     }
   }, [phase]);
+
+  useEffect(() => {
+    if (showChat) {
+      setHasUnreadMessage(false);
+    }
+  }, [showChat]);
 
   async function ensureLocalMedia() {
     const constraints = {
@@ -210,6 +217,8 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
     setChatInput("");
     setRoomCode("");
     setPhase("lobby");
+    setShowChat(false);
+    setHasUnreadMessage(false);
     if (!options.keepError) {
       setError("");
     }
@@ -235,10 +244,14 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
     }
 
     function onChat(msg) {
+      const isOwnMessage = msg.from === socket.id;
       setMessages(prev => [...prev, {
         message: msg.message,
-        sender: msg.from === socket.id ? "You" : "Peer"
+        sender: isOwnMessage ? "You" : "Peer"
       }]);
+      if (!isOwnMessage && !showChat) {
+        setHasUnreadMessage(true);
+      }
     }
 
     function onPeerLeft() {
@@ -274,7 +287,7 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       socket.off("peer:left", onPeerLeft);
       socket.off("call:ended", onCallEnded);
     };
-  }, [socket]);
+  }, [socket, showChat]);
 
   function toggleMic() {
     const stream = localStreamRef.current;
@@ -427,17 +440,10 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       </div>
 
       {/* Header */}
-      <div className="absolute top-0 left-0 right-0 p-4 flex justify-between items-center z-20">
-        <button
-          onClick={leaveCall}
-          className="text-white hover:text-gray-300 transition-colors"
-        >
-          ← Back
-        </button>
+      <div className="absolute top-0 left-0 right-0 p-4 flex justify-center items-center z-20">
         <div className="text-white font-semibold">
           {phase === "connecting" ? "Connecting..." : phase === "in-call" ? "In Call" : "Waiting"}
         </div>
-        <div></div> {/* Spacer */}
       </div>
 
       {/* Error Message */}
@@ -470,14 +476,17 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
           {camOn ? <Video size={18} className="sm:w-5 sm:h-5" /> : <VideoOff size={18} className="sm:w-5 sm:h-5" />}
         </button>
         <button
-          onClick={() => setShowChat(!showChat)}
+          onClick={() => setShowChat((prev) => !prev)}
           className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-colors ${
             showChat
               ? "bg-blue-500 hover:bg-blue-600"
               : "bg-white/20 hover:bg-white/30"
-          }`}
+          } relative`}
         >
           <MessageCircle size={18} className="sm:w-5 sm:h-5" />
+          {hasUnreadMessage && !showChat && (
+            <span className="absolute top-2 right-2 h-2.5 w-2.5 rounded-full bg-red-500" />
+          )}
         </button>
         <button
           onClick={swapCamera}
@@ -496,8 +505,14 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       {/* Chat Interface */}
       {showChat && (
         <div className="absolute right-0 top-0 bottom-0 w-80 bg-black/80 backdrop-blur-sm border-l border-white/20 z-30 flex flex-col">
-          <div className="p-4 border-b border-white/20">
+          <div className="p-4 border-b border-white/20 flex items-center justify-between gap-3">
             <h3 className="text-white font-semibold">Chat</h3>
+            <button
+              onClick={() => setShowChat(false)}
+              className="text-sm text-white/80 hover:text-white transition-colors"
+            >
+              ← Back
+            </button>
           </div>
           <div className="flex-1 overflow-y-auto p-4 space-y-2">
             {messages.map((msg, idx) => (
