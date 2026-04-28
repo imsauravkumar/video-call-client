@@ -8,12 +8,25 @@ import AuthMenu from "./components/AuthMenu";
 import { auth, authConfigError } from "./firebase";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3001";
+const SOCKET_URL = import.meta.env.DEV ? window.location.origin : SERVER_URL;
+const SOCKET_OPTIONS = import.meta.env.DEV
+  ? {
+      autoConnect: false,
+      path: "/socket.io",
+      transports: ["polling"],
+      upgrade: false,
+    }
+  : {
+      autoConnect: false,
+      transports: ["websocket"],
+    };
 
 export default function App() {
   const [view, setView] = useState("lobby");
-  const [socket] = useState(() => io(SERVER_URL, { autoConnect: false }));
+  const [socket] = useState(() => io(SOCKET_URL, SOCKET_OPTIONS));
   const [roomCode, setRoomCode] = useState("");
   const [joinCode, setJoinCode] = useState("");
+  const [roomType, setRoomType] = useState("video");
   const [isHost, setIsHost] = useState(false);
   const [phase, setPhase] = useState("lobby");
   const [error, setError] = useState("");
@@ -103,6 +116,8 @@ export default function App() {
         <Lobby
           socket={socket}
           onEnterCall={handleEnterCall}
+          roomType={roomType}
+          setRoomType={setRoomType}
           roomCode={roomCode}
           setRoomCode={setRoomCode}
           joinCode={joinCode}
@@ -125,6 +140,8 @@ export default function App() {
         <Call
           socket={socket}
           onBack={handleBack}
+          roomType={roomType}
+          setRoomType={setRoomType}
           roomCode={roomCode}
           setRoomCode={setRoomCode}
           isHost={isHost}

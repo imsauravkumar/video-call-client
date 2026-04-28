@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Mic, MicOff, Video, VideoOff, RotateCcw, PhoneOff, MessageCircle } from "lucide-react";
+import { Mic, MicOff, Video, VideoOff, RotateCcw, Phone, MessageCircle } from "lucide-react";
 
 function buildIceServers() {
   const servers = [{ urls: "stun:stun.l.google.com:19302" }];
@@ -24,10 +24,12 @@ function formatCode(code) {
   return `${c.slice(0, 3)} ${c.slice(3)}`;
 }
 
-export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, phase, setPhase, error, setError, messages, setMessages, chatInput, setChatInput }) {
+export default function Call({ socket, onBack, roomType, setRoomType, roomCode, setRoomCode, isHost, phase, setPhase, error, setError, messages, setMessages, chatInput, setChatInput }) {
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
   const [facingMode, setFacingMode] = useState("user");
+  const [localAudioLevel, setLocalAudioLevel] = useState(0);
+  const [remoteAudioLevel, setRemoteAudioLevel] = useState(0);
   const [localVideoPos, setLocalVideoPos] = useState({ x: 20, y: 20 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
@@ -44,8 +46,17 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
   const remoteStreamRef = useRef(null);
   const roomCodeRef = useRef("");
   const isHostRef = useRef(false);
+  const pendingIceCandidatesRef = useRef([]);
+  const disconnectTimeoutRef = useRef(null);
+  const localAudioAnalyserRef = useRef(null);
+  const remoteAudioAnalyserRef = useRef(null);
+  const localAudioCleanupRef = useRef(null);
+  const remoteAudioCleanupRef = useRef(null);
+  const levelAnimationRef = useRef(null);
 
   const iceServers = useMemo(() => buildIceServers(), []);
+  const isVoiceRoom = roomType === "voice";
+  const roomLabel = isVoiceRoom ? "Voice Room" : "Video Room";
 
   useEffect(() => {
     roomCodeRef.current = roomCode;
@@ -55,10 +66,14 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
     if (phase !== "lobby") {
       ensureLocalMedia().catch((e) => {
         console.error("Failed to open local media", e);
-        setError("Unable to access camera or microphone.");
+        setError(isVoiceRoom ? "Unable to access microphone." : "Unable to access camera or microphone.");
       });
     }
-  }, [phase, facingMode]);
+  }, [phase, facingMode, roomType]);
+
+  useEffect(() => {
+    setCamOn(!isVoiceRoom);
+  }, [isVoiceRoom]);
 
   useEffect(() => {
     isHostRef.current = isHost;
@@ -70,6 +85,29 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       console.log("Remote stream tracks:", remoteStreamRef.current.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled })));
     }
   }, [phase]);
+
+  useEffect(() => {
+    if (!isVoiceRoom) return;
+
+    function updateLevels() {
+      const nextLocalLevel = readAnalyserLevel(localAudioAnalyserRef.current);
+      const nextRemoteLevel = readAnalyserLevel(remoteAudioAnalyserRef.current);
+      setLocalAudioLevel(nextLocalLevel);
+      setRemoteAudioLevel(nextRemoteLevel);
+      levelAnimationRef.current = window.requestAnimationFrame(updateLevels);
+    }
+
+    levelAnimationRef.current = window.requestAnimationFrame(updateLevels);
+
+    return () => {
+      if (levelAnimationRef.current) {
+        window.cancelAnimationFrame(levelAnimationRef.current);
+      }
+      levelAnimationRef.current = null;
+      setLocalAudioLevel(0);
+      setRemoteAudioLevel(0);
+    };
+  }, [isVoiceRoom]);
 
   useEffect(() => {
     if (showChat) {
@@ -104,13 +142,20 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
 
   async function ensureLocalMedia() {
     const constraints = {
-      video: { facingMode },
-      audio: true,
+      video: isVoiceRoom ? false : { facingMode },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
     };
 
     if (!localStreamRef.current) {
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       localStreamRef.current = stream;
+      if (isVoiceRoom) {
+        attachAudioAnalyser(stream, localAudioAnalyserRef, localAudioCleanupRef);
+      }
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
       return stream;
     }
@@ -135,6 +180,9 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       console.log("Received remote track:", event.track.kind, "enabled:", event.track.enabled);
       if (!remoteStreamRef.current) return;
       remoteStreamRef.current.addTrack(event.track);
+      if (isVoiceRoom) {
+        attachAudioAnalyser(remoteStreamRef.current, remoteAudioAnalyserRef, remoteAudioCleanupRef);
+      }
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = remoteStreamRef.current;
       }
@@ -152,11 +200,23 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
       console.log("Connection state:", state);
+      if (disconnectTimeoutRef.current) {
+        clearTimeout(disconnectTimeoutRef.current);
+        disconnectTimeoutRef.current = null;
+      }
       if (state === "connected") {
         setPhase("in-call");
+        setError("");
       }
-      if (state === "failed" || state === "closed" || state === "disconnected") {
+      if (state === "failed") {
         setError("Connection lost. Please try again.");
+      }
+      if (state === "disconnected") {
+        disconnectTimeoutRef.current = setTimeout(() => {
+          if (pc.connectionState === "disconnected") {
+            setError("Connection lost. Please try again.");
+          }
+        }, 2500);
       }
     };
 
@@ -194,6 +254,18 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
     });
   }
 
+  async function flushPendingIceCandidates(pc) {
+    if (!pc?.remoteDescription?.type || !pendingIceCandidatesRef.current.length) return;
+
+    const queuedCandidates = [...pendingIceCandidatesRef.current];
+    pendingIceCandidatesRef.current = [];
+
+    for (const candidate of queuedCandidates) {
+      console.log("Flushing queued ICE candidate");
+      await pc.addIceCandidate(candidate);
+    }
+  }
+
   async function handleSignal(data) {
     if (!pcRef.current) await preparePeer();
     const pc = pcRef.current;
@@ -204,6 +276,7 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       if (data?.type === "offer") {
         console.log("Setting remote offer");
         await pc.setRemoteDescription(new RTCSessionDescription(data.description));
+        await flushPendingIceCandidates(pc);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit("signal", {
@@ -213,10 +286,17 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       } else if (data?.type === "answer") {
         console.log("Setting remote answer");
         await pc.setRemoteDescription(new RTCSessionDescription(data.description));
+        await flushPendingIceCandidates(pc);
       } else if (data?.type === "ice") {
         if (data.candidate) {
-          console.log("Adding ICE candidate");
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          const candidate = new RTCIceCandidate(data.candidate);
+          if (pc.remoteDescription?.type) {
+            console.log("Adding ICE candidate");
+            await pc.addIceCandidate(candidate);
+          } else {
+            console.log("Queueing ICE candidate until remote description is ready");
+            pendingIceCandidatesRef.current.push(candidate);
+          }
         }
       }
     } catch (e) {
@@ -230,6 +310,20 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       pcRef.current?.close?.();
     } catch {}
     pcRef.current = null;
+    pendingIceCandidatesRef.current = [];
+    if (disconnectTimeoutRef.current) {
+      clearTimeout(disconnectTimeoutRef.current);
+      disconnectTimeoutRef.current = null;
+    }
+
+    localAudioCleanupRef.current?.();
+    remoteAudioCleanupRef.current?.();
+    localAudioCleanupRef.current = null;
+    remoteAudioCleanupRef.current = null;
+    localAudioAnalyserRef.current = null;
+    remoteAudioAnalyserRef.current = null;
+    setLocalAudioLevel(0);
+    setRemoteAudioLevel(0);
 
     if (localStreamRef.current) {
       for (const track of localStreamRef.current.getTracks()) track.stop();
@@ -244,7 +338,7 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
     cleanupPeerResources();
 
     setMicOn(true);
-    setCamOn(true);
+    setCamOn(!isVoiceRoom);
     setMessages([]);
     setChatInput("");
     setRoomCode("");
@@ -266,7 +360,10 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       setPhase("connecting");
     }
 
-    function onRoomJoined() {
+    function onRoomJoined({ roomType: joinedRoomType }) {
+      if (joinedRoomType) {
+        setRoomType(joinedRoomType);
+      }
       preparePeer().catch(() => {});
       setPhase("connecting");
     }
@@ -319,7 +416,7 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       socket.off("peer:left", onPeerLeft);
       socket.off("call:ended", onCallEnded);
     };
-  }, [socket, showChat]);
+  }, [socket, showChat, setRoomType]);
 
   useEffect(() => {
     return () => {
@@ -333,9 +430,13 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
     const next = !micOn;
     for (const track of stream.getAudioTracks()) track.enabled = next;
     setMicOn(next);
+    if (!next) {
+      setLocalAudioLevel(0);
+    }
   }
 
   function toggleCam() {
+    if (isVoiceRoom) return;
     const stream = localStreamRef.current;
     if (!stream) return;
     const next = !camOn;
@@ -344,6 +445,7 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
   }
 
   async function swapCamera() {
+    if (isVoiceRoom) return;
     const newFacingMode = facingMode === "user" ? "environment" : "user";
     setFacingMode(newFacingMode);
     if (localStreamRef.current) {
@@ -431,11 +533,14 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       <div className="fixed inset-0 bg-slate-950 text-white flex items-center justify-center overflow-hidden">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(59,130,246,0.18),_transparent_28%),radial-gradient(circle_at_bottom_right,_rgba(99,102,241,0.16),_transparent_24%)] pointer-events-none" />
         <div className="relative z-10 text-center px-4">
+          <div className="mb-4 inline-flex rounded-full border border-blue-400/20 bg-blue-500/10 px-4 py-1.5 text-xs font-medium uppercase tracking-[0.22em] text-blue-200">
+            {roomLabel}
+          </div>
           <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight mb-6">Waiting for someone to join</h1>
           <div className="bg-slate-900/55 p-8 rounded-[30px] border border-white/10 shadow-2xl shadow-black/30 backdrop-blur-xl">
             <div className="text-xs font-medium uppercase tracking-[0.22em] text-slate-400 mb-3">Room code</div>
             <div className="text-5xl font-semibold tracking-[0.25em] mb-6">{formatCode(roomCode)}</div>
-            <p className="text-slate-400">Share this code with your friend to start the call.</p>
+            <p className="text-slate-400">Share this code with your friend to start the {isVoiceRoom ? "voice call" : "call"}.</p>
           </div>
           <button
             onClick={leaveCall}
@@ -451,38 +556,94 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
   return (
     <div className="fixed inset-0 bg-black text-white overflow-hidden">
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(15,23,42,0.15),_transparent_30%),linear-gradient(to_bottom,_rgba(2,6,23,0.15),_transparent_32%,_rgba(2,6,23,0.4))] z-0 pointer-events-none" />
-      {/* Remote Video Background */}
       <video
         ref={remoteVideoRef}
         autoPlay
         playsInline
-        className="absolute inset-0 w-full h-full object-cover"
+        className={isVoiceRoom ? "absolute h-0 w-0 opacity-0 pointer-events-none" : "absolute inset-0 w-full h-full object-cover"}
       />
 
-      {/* Local Video Overlay */}
-      <div
-        className="absolute w-32 h-24 sm:w-40 sm:h-30 bg-black/70 rounded-2xl overflow-hidden shadow-2xl shadow-black/30 cursor-move border border-white/10 backdrop-blur-sm z-10"
-        style={{
-          left: `${localVideoPos.x}px`,
-          top: `${localVideoPos.y}px`,
-        }}
-        onMouseDown={handleMouseDown}
-        onTouchStart={handleTouchStart}
-      >
-        <video
-          ref={localVideoRef}
-          autoPlay
-          playsInline
-          muted
-          className="w-full h-full object-cover"
-          style={facingMode === 'user' ? { transform: 'scaleX(-1)' } : {}}
-        />
-      </div>
+      {isVoiceRoom ? (
+        <div className="absolute inset-0 z-10 flex items-center justify-center px-4 py-10">
+          <div className="relative flex h-full w-full max-w-md flex-col overflow-hidden rounded-[30px] border border-white/10 bg-[#0b141a] px-4 pb-8 pt-10 shadow-2xl shadow-black/40 sm:rounded-[36px] sm:px-6 sm:pt-12">
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(34,197,94,0.14),_transparent_26%),linear-gradient(180deg,_rgba(11,20,26,0.96),_rgba(17,27,33,0.98))]" />
+
+            <div className="relative z-10 flex flex-1 flex-col items-center pb-28 text-center sm:pb-32">
+              <div className="mt-12 flex items-center justify-center sm:mt-16">
+                <div
+                  className="flex h-32 w-32 items-center justify-center rounded-full border border-white/10 bg-[#1f2c34] text-4xl font-semibold text-white shadow-[0_20px_80px_rgba(0,0,0,0.35)] transition-transform duration-150 sm:h-40 sm:w-40 sm:text-5xl"
+                  style={{ transform: `scale(${1 + remoteAudioLevel * 0.22})` }}
+                >
+                  F
+                </div>
+              </div>
+
+              <div className="mt-6 text-[28px] font-semibold tracking-tight text-white sm:mt-8 sm:text-3xl">Friend</div>
+              <div className="mt-2 px-4 text-sm text-slate-300">
+                {remoteAudioLevel > 0.12 ? "Speaking..." : phase === "in-call" ? "Voice call in progress" : "Calling..."}
+              </div>
+
+              <div className="mt-6 w-full max-w-[220px] sm:mt-8 sm:max-w-[240px]">
+                <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className="h-full rounded-full bg-[#25d366] transition-[width] duration-150"
+                    style={{ width: `${Math.max(8, remoteAudioLevel * 100)}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="mt-auto w-full pt-10">
+                <div className="flex w-full items-center gap-3 rounded-[22px] border border-white/8 bg-white/5 px-3.5 py-3 text-left shadow-lg shadow-black/10 backdrop-blur-sm sm:justify-between sm:rounded-[28px] sm:px-5 sm:py-4">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-semibold tracking-tight text-white sm:text-[15px]">You</div>
+                    <div className="mt-1 truncate text-[10px] font-medium uppercase tracking-[0.14em] text-slate-400 sm:text-[11px] sm:tracking-[0.16em]">
+                      {localAudioLevel > 0.12 ? "Speaking" : micOn ? "Microphone on" : "Microphone muted"}
+                    </div>
+                  </div>
+                  <div className="w-[88px] shrink-0 sm:ml-4 sm:w-24">
+                    <div className="h-1.5 overflow-hidden rounded-full bg-white/10 sm:h-2">
+                      <div
+                        className="h-full rounded-full bg-[#7ae582] transition-[width] duration-150"
+                        style={{ width: `${Math.max(8, localAudioLevel * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div
+          className="absolute w-32 h-24 sm:w-40 sm:h-30 bg-black/70 rounded-2xl overflow-hidden shadow-2xl shadow-black/30 cursor-move border border-white/10 backdrop-blur-sm z-10"
+          style={{
+            left: `${localVideoPos.x}px`,
+            top: `${localVideoPos.y}px`,
+          }}
+          onMouseDown={handleMouseDown}
+          onTouchStart={handleTouchStart}
+        >
+          <video
+            ref={localVideoRef}
+            autoPlay
+            playsInline
+            muted
+            className="w-full h-full object-cover"
+            style={facingMode === "user" ? { transform: "scaleX(-1)" } : {}}
+          />
+        </div>
+      )}
 
       {/* Header */}
       <div className="absolute top-0 left-0 right-0 p-4 flex justify-center items-center z-20">
-        <div className="rounded-full bg-slate-900/45 px-4 py-2 text-white text-sm font-medium shadow-lg shadow-black/20 backdrop-blur-xl border border-white/10">
-          {phase === "connecting" ? "Connecting..." : phase === "in-call" ? "In Call" : "Waiting"}
+        <div
+          className={`max-w-[calc(100%-2rem)] text-center text-xs font-medium text-white shadow-lg shadow-black/20 backdrop-blur-xl border sm:text-sm ${
+            isVoiceRoom
+              ? "rounded-[22px] border-white/10 bg-slate-950/55 px-4 py-2.5 sm:rounded-[24px] sm:px-5 sm:py-3"
+              : "rounded-full border-white/10 bg-slate-900/45 px-4 py-2"
+          }`}
+        >
+          {roomLabel} • {phase === "connecting" ? "Connecting..." : phase === "in-call" ? "In Call" : "Waiting"}
         </div>
       </div>
 
@@ -494,52 +655,56 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
       )}
 
       {/* Controls */}
-      <div className="absolute bottom-4 sm:bottom-8 left-1/2 transform -translate-x-1/2 flex items-center gap-2 sm:gap-4 z-20">
+      <div className={`absolute left-1/2 z-20 flex max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-2 rounded-[24px] border border-white/10 bg-slate-950/55 px-2.5 py-2.5 shadow-2xl shadow-black/35 backdrop-blur-xl sm:max-w-none sm:gap-3 sm:rounded-[28px] sm:px-4 sm:py-3 ${
+        isVoiceRoom ? "bottom-10 sm:bottom-12" : "bottom-4 sm:bottom-8"
+      }`}>
         <button
           onClick={toggleMic}
-          className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-colors ${
+          className={`flex h-10 w-10 items-center justify-center rounded-[16px] border transition-all duration-200 sm:h-12 sm:w-12 sm:rounded-[18px] ${
             micOn
-              ? "bg-slate-900/45 hover:bg-slate-800/60 border border-white/10"
-              : "bg-red-500 hover:bg-red-600"
+              ? "border-white/10 bg-white/8 text-white hover:-translate-y-0.5 hover:bg-white/14"
+              : "border-red-400/30 bg-red-500 text-white hover:-translate-y-0.5 hover:bg-red-600"
           }`}
         >
-          {micOn ? <Mic size={18} className="sm:w-5 sm:h-5" /> : <MicOff size={18} className="sm:w-5 sm:h-5" />}
+          {micOn ? <Mic size={20} className="h-5 w-5 sm:h-[22px] sm:w-[22px]" /> : <MicOff size={20} className="h-5 w-5 sm:h-[22px] sm:w-[22px]" />}
         </button>
         <button
           onClick={toggleCam}
-          className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-colors ${
+          className={`flex h-10 w-10 items-center justify-center rounded-[16px] border transition-all duration-200 sm:h-12 sm:w-12 sm:rounded-[18px] ${
             camOn
-              ? "bg-slate-900/45 hover:bg-slate-800/60 border border-white/10"
-              : "bg-red-500 hover:bg-red-600"
-          }`}
+              ? "border-white/10 bg-white/8 text-white hover:-translate-y-0.5 hover:bg-white/14"
+              : "border-red-400/30 bg-red-500 text-white hover:-translate-y-0.5 hover:bg-red-600"
+          } ${isVoiceRoom ? "hidden" : ""}`}
         >
-          {camOn ? <Video size={18} className="sm:w-5 sm:h-5" /> : <VideoOff size={18} className="sm:w-5 sm:h-5" />}
+          {camOn ? <Video size={20} className="h-5 w-5 sm:h-[22px] sm:w-[22px]" /> : <VideoOff size={20} className="h-5 w-5 sm:h-[22px] sm:w-[22px]" />}
         </button>
         <button
           ref={chatButtonRef}
           onClick={() => setShowChat((prev) => !prev)}
-          className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-colors ${
+          className={`relative flex h-10 w-10 items-center justify-center rounded-[16px] border transition-all duration-200 sm:h-12 sm:w-12 sm:rounded-[18px] ${
             showChat
-              ? "bg-blue-500 hover:bg-blue-600"
-              : "bg-slate-900/45 hover:bg-slate-800/60 border border-white/10"
-          } relative`}
+              ? "border-blue-300/30 bg-blue-500 text-white shadow-lg shadow-blue-950/30"
+              : "border-white/10 bg-white/8 text-white hover:-translate-y-0.5 hover:bg-white/14"
+          }`}
         >
-          <MessageCircle size={18} className="sm:w-5 sm:h-5" />
+          <MessageCircle size={20} className="h-5 w-5 sm:h-[22px] sm:w-[22px]" />
           {hasUnreadMessage && !showChat && (
-            <span className="absolute top-2 right-2 h-2.5 w-2.5 rounded-full bg-red-500" />
+            <span className="absolute right-1.5 top-1.5 h-2.5 w-2.5 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.8)]" />
           )}
         </button>
         <button
           onClick={swapCamera}
-          className="w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-slate-900/45 hover:bg-slate-800/60 border border-white/10 flex items-center justify-center transition-colors"
+          className={`flex h-10 w-10 items-center justify-center rounded-[16px] border border-white/10 bg-white/8 text-white transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/14 sm:h-12 sm:w-12 sm:rounded-[18px] ${
+            isVoiceRoom ? "hidden" : ""
+          }`}
         >
-          <RotateCcw size={18} className="sm:w-5 sm:h-5" />
+          <RotateCcw size={20} className="h-5 w-5 sm:h-[22px] sm:w-[22px]" />
         </button>
         <button
           onClick={endCall}
-          className="w-12 h-12 sm:w-14 sm:h-14 rounded-full bg-red-500 hover:bg-red-600 shadow-xl shadow-red-950/40 flex items-center justify-center transition-colors ml-2"
+          className="ml-1 flex h-12 w-12 rotate-[135deg] items-center justify-center rounded-[20px] border border-red-300/20 bg-[#ff3b30] text-white shadow-xl shadow-red-950/40 transition-all duration-200 hover:scale-[1.03] hover:bg-[#ff554b] sm:ml-2 sm:h-16 sm:w-16 sm:rounded-[26px]"
         >
-          <PhoneOff size={20} className="sm:w-6 sm:h-6" />
+          <Phone size={24} strokeWidth={3.1} className="h-5 w-5 text-white sm:h-7 sm:w-7" />
         </button>
       </div>
 
@@ -594,4 +759,50 @@ export default function Call({ socket, onBack, roomCode, setRoomCode, isHost, ph
     </div>
   );
 
+}
+
+function attachAudioAnalyser(stream, analyserRef, cleanupRef) {
+  cleanupRef.current?.();
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    analyserRef.current = null;
+    cleanupRef.current = null;
+    return;
+  }
+
+  const audioContext = new AudioContextClass();
+  const source = audioContext.createMediaStreamSource(stream);
+  const analyser = audioContext.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.82;
+  source.connect(analyser);
+  analyserRef.current = analyser;
+
+  cleanupRef.current = () => {
+    try {
+      source.disconnect();
+    } catch {}
+    try {
+      analyser.disconnect();
+    } catch {}
+    try {
+      audioContext.close();
+    } catch {}
+  };
+}
+
+function readAnalyserLevel(analyser) {
+  if (!analyser) return 0;
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteTimeDomainData(data);
+  let sum = 0;
+
+  for (let i = 0; i < data.length; i += 1) {
+    const normalized = (data[i] - 128) / 128;
+    sum += normalized * normalized;
+  }
+
+  const rms = Math.sqrt(sum / data.length);
+  return Math.min(1, rms * 4);
 }
