@@ -5,20 +5,22 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const isDev = mode === "development";
   const proxyTarget = isDev
-    ? env.VITE_DEV_PROXY_TARGET || "http://localhost:3001"
+    ? env.VITE_DEV_PROXY_TARGET || env.VITE_SERVER_URL || "http://localhost:3001"
     : env.VITE_SERVER_URL || "http://localhost:3001";
+  const socketProxy = {
+    target: proxyTarget,
+    changeOrigin: true,
+    ws: true,
+    secure: false,
+  };
 
   return {
     plugins: [react()],
     server: {
       port: 5173,
       proxy: {
-        "/socket.io": {
-          target: proxyTarget,
-          changeOrigin: true,
-          ws: true,
-          secure: false,
-        },
+        "/socket.io": socketProxy,
+        "/socket.io/": socketProxy,
       },
     },
   };

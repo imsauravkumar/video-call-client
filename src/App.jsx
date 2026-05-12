@@ -7,19 +7,14 @@ import Login from "./components/Login";
 import AuthMenu from "./components/AuthMenu";
 import { auth, authConfigError } from "./firebase";
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3001";
-const SOCKET_URL = import.meta.env.DEV ? window.location.origin : SERVER_URL;
-const SOCKET_OPTIONS = import.meta.env.DEV
-  ? {
-      autoConnect: false,
-      path: "/socket.io",
-      transports: ["polling"],
-      upgrade: false,
-    }
-  : {
-      autoConnect: false,
-      transports: ["websocket"],
-    };
+const SERVER_URL = import.meta.env.VITE_SERVER_URL?.trim();
+const SOCKET_URL = SERVER_URL || window.location.origin;
+const SOCKET_OPTIONS = {
+  autoConnect: false,
+  path: "/socket.io",
+  transports: ["polling", "websocket"],
+  timeout: 10000,
+};
 
 export default function App() {
   const [view, setView] = useState("lobby");
@@ -58,6 +53,36 @@ export default function App() {
 
     socket.disconnect();
   }, [authUser, socket]);
+
+  useEffect(() => {
+    function handleConnect() {
+      setError("");
+    }
+
+    function handleConnectError(err) {
+      console.error("Socket connection error:", err);
+      const failedTransport = err?.transport ? ` (${err.transport})` : "";
+      const message =
+        err?.message?.includes("xhr poll error") || err?.message?.includes("websocket error")
+          ? `Unable to reach the call server${failedTransport}. Please try again in a moment.`
+          : err?.message || "Unable to connect to the call server.";
+      setError(message);
+    }
+
+    function handleDisconnect(reason) {
+      console.warn("Socket disconnected:", reason);
+    }
+
+    socket.on("connect", handleConnect);
+    socket.on("connect_error", handleConnectError);
+    socket.on("disconnect", handleDisconnect);
+
+    return () => {
+      socket.off("connect", handleConnect);
+      socket.off("connect_error", handleConnectError);
+      socket.off("disconnect", handleDisconnect);
+    };
+  }, [socket]);
 
   function handleEnterCall(newPhase) {
     setPhase(newPhase);
